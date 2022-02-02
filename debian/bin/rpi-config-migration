@@ -1,0 +1,272 @@
+BOOT=${BOOT:-/boot/firmware}
+HOST_ARCH=${HOST_ARCH:-$(dpkg --print-architecture)}
+
+is_old_config() {
+    local cksum=$(md5sum "$BOOT/config.txt" | cut -d" " -f1)
+
+    case "$cksum" in
+        "02aace91425bbaa9e1ac7fe5fefdba86")
+            # Old armhf config.txt
+            return 0
+            ;;
+        "71269af3a192379c3001b10c66345889")
+            # Old arm64 config.txt
+            return 0
+            ;;
+        "f5a2110f821b89009561f47dd9d4e670")
+            # New armhf config.txt
+            return 1
+            ;;
+        "46a426582ff4b1eb2581700b70f8c440")
+            # New arm64 config.txt
+            return 1
+            ;;
+        *)
+            if grep -q "^\[" "$BOOT/config.txt"; then
+                # Something with a conditional section...
+                if [ -f "$BOOT/usercfg.txt" ] && [ -f "$BOOT/syscfg.txt" ]; then
+                    # Probably a modified new configuration (naughty naughty)
+                    return 1
+                elif [ -f "$BOOT/cmdline.txt" ] && [ -f "$BOOT/uboot.bin" ]; then
+                    # Probably an old configuration with conditional sections
+                    return 0
+                else
+                    # No idea! Neither files from the old or new setup exist,
+                    # the hashes don't match, and there's a conditional
+                    # section. This is sufficiently custom we probably
+                    # shouldn't touch it...
+                    return 2
+                fi
+            else
+                # No conditional sections; probably a modified old config
+                return 0
+            fi
+            ;;
+    esac
+}
+
+migrate_config() {
+    # Write out all the new included files
+    cat > "$BOOT/README" << EOF
+An overview of the files on the /boot/firmware partition (the 1st partition
+on the SD card) used by the Ubuntu boot process (roughly in order) is as
+follows:
+
+* bootcode.bin   - this is the second stage bootloader loaded by all pis with
+                   the exception of the pi4 (where this is replaced by flash
+                   memory)
+* config.txt     - the first configuration file read by the boot process
+* syscfg.txt     - the file in which system modified configuration will be
+                   placed, included by config.txt
+* usercfg.txt    - the file in which user modified configuration should be
+                   placed, included by config.txt
+* start*.elf     - the third stage bootloader, which handles device-tree
+                   modification and which loads...
+* uboot*.bin     - various u-boot binaries for different pi platforms; these
+                   are launched as the "kernel" by config.txt
+* boot.scr       - the boot script executed by uboot*.bin which in turn
+                   loads...
+* vmlinuz        - the Linux kernel, executed by boot.scr
+* initrd.img     - the initramfs, executed by boot.scr
+* meta-data      - meta-data for cloud-init; usually just contains the
+                   instance id
+* network-config - network configuration for cloud-init; edit this to set up
+                   wifi access points and other networking settings
+* user-data      - user-data for cloud-init; edit this to configure initial
+                   users, SSH keys, packages, etc.
+EOF
+    cat > "$BOOT/nobtcfg.txt" << EOF
+# This configuration file sets the system up to support the serial console on
+# GPIOs 14 & 15. This is the default for Ubuntu on the Pi, but disables the use
+# of the Bluetooth module.
+#
+# If you wish to disable the serial console and use Bluetooth instead, install
+# the "pi-bluetooth" package then edit "syscfg.txt" to include "btcfg.txt"
+# instead of "nobtcfg.txt"
+
+enable_uart=1
+cmdline=nobtcmd.txt
+#dtoverlay=pi3-disable-bt
+EOF
+    new_cmdline_txt "ttyAMA0,115200" > "$BOOT/nobtcmd.txt"
+    cat > "$BOOT/btcfg.txt" << EOF
+# See "nobtcfg.txt" for further information.
+
+enable_uart=0
+cmdline=btcmd.txt
+EOF
+    new_cmdline_txt "" > "$BOOT/btcmd.txt"
+    cat > "$BOOT/syscfg.txt" << EOF
+# This file is intended to contain system-made configuration changes. User
+# configuration changes should be placed in "usercfg.txt". Please refer to the
+# README file for a description of the various configuration files on the boot
+# partition.
+
+dtparam=i2c_arm=on
+dtparam=spi=on
+
+include nobtcfg.txt
+EOF
+
+    # Migrate any non-standard rules from config.txt to usercfg.txt and move
+    # the old config.txt to config.bak (with a header explaining its presence).
+    # If this header is altered, please adjust old_config_txt (called from
+    # unmigrate_config) below
+    cat > "$BOOT/usercfg.txt" << EOF
+# Place "config.txt" changes (dtparam, dtoverlay, disable_overscan, etc.) in
+# this file. Please refer to the README file for a description of the various
+# configuration files on the boot partition.
+
+EOF
+    grep -v \
+        "^\(enable_uart\|device_tree_address\|kernel\|dtparam *= *spi\|dtparam *= *i2c_arm\|arm_64bit\) *=" \
+        "$BOOT/config.txt" >> "$BOOT/usercfg.txt" || true
+    cat - "$BOOT/config.txt" > "$BOOT/config.bak" << EOF
+# This file contains a backup of your original "config.txt" below. All relevant
+# settings from this file have been migrated to the "usercfg.txt" file. Please
+# ensure this migration has been successful before removing this file (if
+# anything went wrong with the migration, please file a bug against the
+# "u-boot-rpi" package on launchpad.net).
+
+EOF
+    new_config_txt > "$BOOT/config.txt"
+
+    # Finally, remove the old cmdline.txt and uboot.bin
+    rm -f "$BOOT/cmdline.txt"
+    case "$HOST_ARCH" in
+        armhf)
+            rm -f "$BOOT/uboot.bin"
+            ;;
+        arm64)
+            rm -f "$BOOT/kernel8.img"
+            ;;
+    esac
+}
+
+new_cmdline_txt() {
+    local serial_console root_label root_device
+
+    serial_console=$1
+    if [ -n "$serial_console" ]; then
+        serial_console=" console=$serial_console"
+    fi
+    root_label=""
+    root_device=$(awk '$2=="/" {print $1}' /proc/mounts)
+    if [ -n "$root_device" ]; then
+        root_label=$(lsblk -o LABEL -P "$root_device" 2>/dev/null || echo -n "")
+    fi
+    if [ -z "$root_label" ]; then
+        # Something's gone horribly wrong; either we can't find the root mount
+        # in /proc/mounts, or lsblk has failed to retrieve the volume label so
+        # fallback to the default
+        root_label="LABEL=writable"
+    fi
+    cat << EOF
+net.ifnames=0 dwc_otg.lpm_enable=0${serial_console} console=tty1 root=${root_label} rootfstype=ext4 elevator=deadline rootwait
+EOF
+}
+
+new_config_txt() {
+    case "$HOST_ARCH" in
+        armhf)
+            suffix="_32b"
+            ;;
+        arm64)
+            suffix=""
+            ;;
+    esac
+    cat << EOF
+# Please DO NOT modify this file; if you need to modify the boot config, the
+# "usercfg.txt" file is the place to include user changes. Please refer to
+# the README file for a description of the various configuration files on
+# the boot partition.
+
+# The unusual ordering below is deliberate; older firmwares (in particular the
+# version initially shipped with bionic) don't understand the conditional
+# [sections] below and simply ignore them. The Pi4 doesn't boot at all with
+# firmwares this old so it's safe to place at the top. Of the Pi2 and Pi3, the
+# Pi3 uboot happens to work happily on the Pi2, so it needs to go at the bottom
+# to support old firmwares.
+
+[pi4]
+kernel=uboot_rpi_4${suffix}.bin
+max_framebuffers=2
+
+[pi2]
+kernel=uboot_rpi_2.bin
+
+[pi3]
+kernel=uboot_rpi_3${suffix}.bin
+
+[all]
+EOF
+    if [ "$HOST_ARCH" = "arm64" ]; then
+        echo "arm_64bit=1"
+    fi
+    cat << EOF
+device_tree_address=0x03000000
+
+# The following settings are "defaults" expected to be overridden by the
+# included configuration. The only reason they are included is, again, to
+# support old firmwares which don't understand the "include" command.
+
+enable_uart=1
+cmdline=nobtcmd.txt
+
+include syscfg.txt
+include usercfg.txt
+EOF
+}
+
+unmigrate_config() {
+    # Undo the migration routine above; this function is strictly intended for
+    # testing but is included in case it comes in handy in the field. Be warned
+    # that it DOES NOT perform any checks that what it is migrating is indeed
+    # a new configuration - it just goes ahead and does what it wants
+    rm -f \
+        "$BOOT/README" \
+        "$BOOT/nobtcfg.txt" \
+        "$BOOT/btcfg.txt" \
+        "$BOOT/btcmd.txt" \
+        "$BOOT/syscfg.txt"
+    mv "$BOOT/nobtcmd.txt" "$BOOT/cmdline.txt"
+    if [ -f "$BOOT/config.bak" ]; then
+        tail -n +7 "$BOOT/config.bak" > "$BOOT/config.txt"
+        rm -f "$BOOT/usercfg.txt" "$BOOT/config.bak"
+    else
+        old_config_txt > "$BOOT/config.txt"
+        rm -f "$BOOT/usercfg.txt"
+    fi
+    # We simply copy the Pi3 u-boot back here because firstly the original
+    # cannot have been the Pi4 u-boot (didn't exist prior to the 2019.07
+    # version) and secondly it's compatible with the Pi2 and Pi3
+    case "$HOST_ARCH" in
+        armhf)
+            cp "$BOOT/uboot_rpi_3_32b.bin" "$BOOT/uboot.bin"
+            ;;
+        arm64)
+            cp "$BOOT/uboot_rpi_3.bin" "$BOOT/kernel8.img"
+            ;;
+    esac
+}
+
+old_config_txt() {
+    echo "enable_uart=1"
+    case "$HOST_ARCH" in
+        armhf)
+            echo "kernel=uboot.bin"
+            ;;
+        arm64)
+            echo "kernel=kernel8.bin"  # yes, this is wrong; that's how it was
+            ;;
+    esac
+    cat << EOF
+device_tree_address=0x03000000
+dtparam=i2c_arm=on
+dtparam=spi=on
+EOF
+    if [ "$HOST_ARCH" = "arm64" ]; then
+        echo "arm_64bit=1"
+    fi
+    tail -n +5 "$BOOT/usercfg.txt"
+}
